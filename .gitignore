@@ -1,0 +1,17 @@
+# Local-only Claude guidelines (not pushed)
+CLAUDE.md
+CLAUDE.local.md
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local data
+*.db
