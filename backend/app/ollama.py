@@ -6,6 +6,12 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 # First load of a model from disk measured at ~61s on the GTX 1650, so keep this generous.
 TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+# Small models sometimes fall into endless repetition; a live run hit the 300s timeout that way.
+# 1536 tokens is ~35s on the GTX 1650 and well above the ~600-750 tokens a normal answer used.
+NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1536"))
+TRUNCATED_NOTE = "\n\n[Output dipotong: batas panjang jawaban tercapai]"
+# Probe 2026-11-28 (qwen2.5-coder:3b): these cut repetition and made output length consistent.
+SAMPLING = {"temperature": 0.2, "repeat_penalty": 1.1}
 
 
 class OllamaError(Exception):
@@ -29,8 +35,11 @@ async def health() -> dict:
         return {"ok": False, "url": OLLAMA_URL, "error": f"Ollama tidak dapat dihubungi: {e!r}"}
 
 
-async def generate(model: str, system: str, prompt: str) -> dict:
-    payload = {"model": model, "system": system, "prompt": prompt, "stream": False, "options": {"num_ctx": NUM_CTX}}
+async def generate(model: str, system: str, prompt: str, fmt: str | None = None) -> dict:
+    payload = {"model": model, "system": system, "prompt": prompt, "stream": False,
+               "options": {"num_ctx": NUM_CTX, "num_predict": NUM_PREDICT, **SAMPLING}}
+    if fmt:
+        payload["format"] = fmt
     try:
         async with httpx.AsyncClient(base_url=OLLAMA_URL, timeout=TIMEOUT) as client:
             r = await client.post("/api/generate", json=payload)
@@ -47,8 +56,11 @@ async def generate(model: str, system: str, prompt: str) -> dict:
             detail = r.text
         raise OllamaError(f"Ollama error {r.status_code}: {detail}")
     data = r.json()
+    text = strip_think(data.get("response", ""))
+    if data.get("done_reason") == "length":
+        text += TRUNCATED_NOTE
     return {
-        "text": strip_think(data.get("response", "")),
+        "text": text,
         "input_tokens": data.get("prompt_eval_count"),
         "output_tokens": data.get("eval_count"),
     }

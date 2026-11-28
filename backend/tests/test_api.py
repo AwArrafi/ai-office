@@ -1,21 +1,11 @@
 import asyncio
 import time
 
-import pytest
-from fastapi.testclient import TestClient
-
-from app import db, main, ollama
-
-
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "test.db"))
-    with TestClient(main.app) as c:
-        yield c
+from app import db, ollama
 
 
 def fake_generate(text="hasil", delay=0.0, error=None):
-    async def gen(model, system, prompt):
+    async def gen(model, system, prompt, fmt=None):
         await asyncio.sleep(delay)
         if error:
             raise ollama.OllamaError(error)
@@ -115,3 +105,19 @@ def test_restart_marks_interrupted_task_failed(client, tmp_path):
     db.init_db()
     assert client.get(f"/tasks/{tid}").json()["status"] == "Failed"
     assert client.get("/agents/2").json()["status"] == "Idle"
+
+
+def test_generate_caps_and_marks_truncated_output(monkeypatch):
+    import httpx
+    sent = {}
+
+    def handler(req):
+        sent.update(__import__("json").loads(req.content))
+        return httpx.Response(200, json={"response": "abc", "done_reason": "length", "prompt_eval_count": 1, "eval_count": 2})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(ollama.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    r = asyncio.run(ollama.generate("m", "s", "p", fmt="json"))
+    assert r["text"] == "abc" + ollama.TRUNCATED_NOTE
+    assert sent["options"]["num_predict"] == ollama.NUM_PREDICT and sent["format"] == "json"
+    assert sent["options"]["temperature"] == ollama.SAMPLING["temperature"]

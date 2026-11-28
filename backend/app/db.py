@@ -8,8 +8,9 @@ from pathlib import Path
 DB_PATH = os.getenv("AI_OFFICE_DB", str(Path(__file__).resolve().parent.parent / "ai_office.db"))
 DEFAULT_MODEL = os.getenv("AI_OFFICE_MODEL", "qwen2.5-coder:3b")
 
-# Schema follows PRD §10, plus agents.status (real backend state for the dashboard)
-# and executions.output (the agent's result). Approvals table arrives in Phase 4.
+# Schema follows PRD §10, plus agents.status (real backend state for the dashboard),
+# executions.output (the agent's result) and executions.step (plan/work/review/revise/report).
+# Approvals table arrives in Phase 4.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
     id INTEGER PRIMARY KEY,
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS executions (
     provider TEXT NOT NULL,
     model TEXT NOT NULL,
     status TEXT NOT NULL,
+    step TEXT,
     output TEXT,
     input_tokens INTEGER,
     output_tokens INTEGER,
@@ -112,6 +114,9 @@ def set_agent_status(c, agent_id: int, status: str, task_id=None):
 def init_db():
     with conn() as c:
         c.executescript(SCHEMA)
+        # Phase 1 databases predate executions.step.
+        if "step" not in {r["name"] for r in c.execute("PRAGMA table_info(executions)")}:
+            c.execute("ALTER TABLE executions ADD COLUMN step TEXT")
         ts = now()
         for name, role, desc, prompt in SEED_AGENTS:
             c.execute(
@@ -120,7 +125,7 @@ def init_db():
                 (name, role, desc, prompt, DEFAULT_MODEL, ts, ts),
             )
         # A restart kills in-flight work; record it honestly instead of leaving stale "In Progress" rows.
-        for row in c.execute("SELECT id, assigned_agent_id FROM tasks WHERE status='In Progress'").fetchall():
+        for row in c.execute("SELECT id, assigned_agent_id FROM tasks WHERE status IN ('In Progress', 'Under Review')").fetchall():
             set_task_status(c, row["id"], "Failed", agent_id=row["assigned_agent_id"])
         c.execute(
             "UPDATE executions SET status='Failed', completed_at=?, error_message='Dihentikan karena backend restart' "

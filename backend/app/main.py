@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import agents, db, ollama
+from . import agents, db, ollama, orchestrator
 
 
 @asynccontextmanager
@@ -20,6 +20,10 @@ class TaskCreate(BaseModel):
     description: str = Field(default="", max_length=10_000)
     assigned_agent_id: int
     priority: int = Field(default=0, ge=0, le=10)
+
+
+class InstructionCreate(BaseModel):
+    instruction: str = Field(min_length=1, max_length=5_000)
 
 
 def _get(c, table: str, id_: int):
@@ -104,6 +108,46 @@ async def cancel_task(task_id: int):
             raise HTTPException(409, f"Task sudah {task['status']}")
         db.set_task_status(c, task_id, "Cancelled", agent_id=task["assigned_agent_id"])
     return {"task_id": task_id, "status": "Cancelled"}
+
+
+@app.post("/instructions", status_code=202)
+async def create_instruction(body: InstructionCreate):
+    active = agents.active_task_id()
+    if active is not None:
+        raise HTTPException(409, f"Task {active} masih berjalan; hanya satu task aktif yang diizinkan")
+    with db.conn() as c:
+        team = c.execute("SELECT name, is_active FROM agents WHERE name IN ('Manager','Developer','QA')").fetchall()
+        inactive = [r["name"] for r in team if not r["is_active"]]
+        if len(team) < 3 or inactive:
+            raise HTTPException(400, f"Workflow butuh Manager, Developer, dan QA aktif (nonaktif: {inactive})")
+        manager_id = c.execute("SELECT id FROM agents WHERE name='Manager'").fetchone()["id"]
+        ts = db.now()
+        text = body.instruction.strip()
+        task_id = c.execute(
+            "INSERT INTO tasks (title, description, status, assigned_agent_id, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+            (text[:80], text, "Assigned", manager_id, ts, ts),
+        ).lastrowid
+        db.log(c, "instruction_received", f"Instruksi CEO diterima sebagai task {task_id}", agent_id=manager_id, task_id=task_id)
+    agents.start(task_id, orchestrator.run_instruction)
+    return {"task_id": task_id, "status": "started"}
+
+
+@app.get("/instructions/{task_id}")
+def get_instruction(task_id: int):
+    with db.conn() as c:
+        task = _get(c, "tasks", task_id)
+        execs = lambda tid: [dict(r) for r in c.execute("SELECT * FROM executions WHERE task_id=? ORDER BY id", (tid,))]
+        task["executions"] = execs(task_id)
+        task["subtasks"] = [dict(r, executions=execs(r["id"]))
+                            for r in c.execute("SELECT * FROM tasks WHERE parent_task_id=? ORDER BY id", (task_id,))]
+        report = next((e["output"] for e in reversed(task["executions"]) if e["step"] == "report" and e["output"]), None)
+        # The note is added at read time so it can never be dropped by the model.
+        task["report"] = f"{report}\n\n---\n{orchestrator.UNTESTED_NOTE}" if report else None
+        task["tested"] = False
+        err = c.execute("SELECT description FROM activity_logs WHERE task_id=? AND event_type='orchestration_error' "
+                        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        task["error"] = err["description"] if err else None
+        return task
 
 
 @app.get("/activity")
